@@ -7,7 +7,7 @@ push:
 env:
 GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
 
-# --- FIX: We now have TWO region variables ---
+
 GAR_REGION: asia-south1     # Region for your Artifact Registry
 GKE_REGION: asia-south2     # Region for your GKE Cluster
 
