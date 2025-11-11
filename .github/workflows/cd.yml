@@ -86,14 +86,107 @@ jobs:
           sed -i 's|YOUR_MLFLOW_SERVER_IP|${{ secrets.MLFLOW_SERVER_IP }}|g' k8s/deployment.yaml
           sed -i 's|YOUR_PROJECT_ID|${{ env.GCP_PROJECT_ID }}|g' k8s/deployment.yaml
           
-      - name: Set production values in k8s manifest
-        run: |
-          sed -i 's|YOUR_MLFLOW_SERVER_IP|${{ secrets.MLFLOW_SERVER_IP }}|g' k8s/deployment.yaml
-          sed -i 's|YOUR_PROJECT_ID|${{ env.GCP_PROJECT_ID }}|g' k8s/deployment.yaml
-
       - name: Deploy to GKE
         run: |
           export FULL_IMAGE_URI="${{ env.GAR_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.GAR_REPO_NAME }}/${{ needs.build-and-push-image.outputs.image_name }}:${{ needs.build-and-push-image.outputs.image_tag }}"
           echo "Deploying with image: $FULL_IMAGE_URI"
-          kubectl apply -f k8s/deployment.yaml
+          
+          # Apply ALL .yaml files in the k8s/ directory (deployment, service, hpa)
+          kubectl apply -f k8s/
+          
+          # Set the newly built image on the deployment
           kubectl set image deployment/${{ env.DEPLOYMENT_NAME }} api-container=$FULL_IMAGE_URI
+
+  stress-test:
+    name: Stress Test Deployed API
+    runs-on: ubuntu-latest
+    # This job runs AFTER the deploy job is successful
+    needs: deploy-to-gke
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Authenticate to GCP
+        id: auth
+        uses: 'google-github-actions/auth@v1'
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      
+      - name: Install gke-gcloud-auth-plugin and wrk
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl gnupg
+          curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | sudo tee -a /etc/apt/sources.list.d/google-cloud-sdk.list
+          sudo apt-get update
+          # Install both the GKE plugin and wrk
+          sudo apt-get install -y google-cloud-cli-gke-gcloud-auth-plugin wrk
+
+      - name: Get GKE credentials
+        run: gcloud container clusters get-credentials ${{ env.GKE_CLUSTER_NAME }} --region ${{ env.GKE_REGION }}
+      
+      - name: Get External IP of Service
+        id: get_ip
+        run: |
+          echo "Waiting for external IP address..."
+          export SERVICE_IP=""
+          for _ in {1..20}; do
+            SERVICE_IP=$(kubectl get service iris-api-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            if [ -n "$SERVICE_IP" ]; then
+              echo "External IP found: $SERVICE_IP"
+              # Set the IP as a GitHub Actions output for the next step
+              echo "SERVICE_IP=$SERVICE_IP" >> $GITHUB_OUTPUT
+              break
+            fi
+            echo "IP not ready, sleeping 15 seconds..."
+            sleep 15
+          done
+          if [ -z "$SERVICE_IP" ]; then
+            echo "Error: External IP not provisioned after 5 minutes."
+            exit 1
+          fi
+
+      - name: Test 1 - Run Autoscaling Test (1 Pod -> 3 Pods)
+        run: |
+          export SERVICE_IP=${{ steps.get_ip.outputs.SERVICE_IP }}
+          echo "--- Starting Test 1: Autoscaling (max 3 pods) ---"
+          echo "Running 1000+ requests (200 concurrent connections for 30s)..."
+          
+          # Run wrk with 4 threads, 200 connections, for 30s, using our Lua script
+          wrk -t4 -c200 -d30s -s scripts/post.lua http://$SERVICE_IP/predict
+          
+          echo "Load test finished. Waiting 60s for HPA to react..."
+          sleep 60
+          
+          echo "--- HPA Status (Should show >1 replica) ---"
+          kubectl get hpa iris-api-hpa
+          echo "---------------------------------------------"
+          kubectl get pods
+
+      - name: Test 2 - Run Bottleneck Test (Max 1 Pod)
+        run: |
+          export SERVICE_IP=${{ steps.get_ip.outputs.SERVICE_IP }}
+          echo "--- Starting Test 2: Bottleneck (max 1 pod) ---"
+          echo "Patching HPA to set maxReplicas=1..."
+          kubectl patch hpa iris-api-hpa --patch '{"spec":{"maxReplicas":1}}'
+          
+          echo "Waiting 90s for pods to scale down to 1..."
+          sleep 90
+          
+          echo "--- Pod Status (Should show 1 replica) ---"
+          kubectl get pods
+          echo "--------------------------------------------"
+          
+          echo "Running 2000+ requests (400 concurrent connections for 30s)..."
+          # Run a more intense test
+          wrk -t8 -c400 -d30s -s scripts/post.lua http://$SERVICE_IP/predict
+          
+          echo "Load test finished. Observe the higher latency/error rate in the output above."
+          echo "--- HPA Status (Should show 1 replica, but with high target %) ---"
+          kubectl get hpa iris-api-hpa
+          echo "--------------------------------------------"
