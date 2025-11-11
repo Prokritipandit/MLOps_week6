@@ -97,6 +97,10 @@ jobs:
           # Set the newly built image on the deployment
           kubectl set image deployment/${{ env.DEPLOYMENT_NAME }} api-container=$FULL_IMAGE_URI
 
+          # --- ADD THIS LINE ---
+          echo "Waiting for deployment rollout to finish..."
+          kubectl rollout status deployment/${{ env.DEPLOYMENT_NAME }} --timeout=5m
+
   stress-test:
     name: Stress Test Deployed API
     runs-on: ubuntu-latest
